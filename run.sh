@@ -23,4 +23,6 @@ do
 	bash ./publish.sh "$ID" "$TIMESTAMP" "$MINUTES" "/tmp/__QRSS__$ID.png"
 
 	rm -f /tmp/*__QRSS__$ID*.wav "/tmp/__QRSS__$ID.png"
+
+	test -z "$ONCE" || break
 done
