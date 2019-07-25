@@ -1,30 +1,27 @@
 package transform
 
 import (
-	"github.com/strickyak/kiwisdr-qrss-grabber-client/font5x7"
+	"github.com/strickyak/kiwisdr-qrss-grabber/font5x7"
 
 	"image"
 	"image/color"
 	"log"
+	"math"
 )
 
 var _ = log.Printf
 
-// const SampPerSec = 12000
-// const TargetBW = 300
-// const ImageHeight = 600
-// // const FFTSize = (1 << 15)
-// const FFTSize = (1 << 8)
-
-func BuildImage(in <-chan []uint16, imprint string) image.Image {
-	count := 0
-	var sum uint64
-	var min, max uint16
-	var cols [][]uint16
+func BuildImage(in <-chan []float64, imprint string) image.Image {
+	var count float64
+	var sum float64
+	var sumsq float64
+	var min, max float64
+	var cols [][]float64
 	for arr := range in {
 		for _, e := range arr {
 			count++
-			sum += uint64(e)
+			sum += float64(e)
+			sumsq += float64(e * e)
 			if e < min || min == 0 {
 				min = e
 			}
@@ -34,12 +31,22 @@ func BuildImage(in <-chan []uint16, imprint string) image.Image {
 		}
 		cols = append(cols, arr)
 	}
-	mean := float64(sum) / float64(count)
-	log.Printf("BuildImage: min=%d mean=%.1f max=%d", min, mean, max)
+	mean := sum / count
+	log.Printf("BuildImage: min=%.1f mean=%.1f max=%.1f", min, mean, max)
 
-	fakemin := uint16(int((float64(min) + mean) / 2)) // fake min is halfway between min & mean.
+	naïve_variance := ((sumsq) - ((sum) * (sum) / (count))) / (count - 1)
+	std_dev := math.Sqrt(naïve_variance)
+	leap := 1.0 * std_dev
 
-	span := float64(max - fakemin)
+	min1 := (sum)/(count) + leap
+	max1 := min1 + leap
+	min2 := max1
+	max2 := min2 + leap
+	min3 := max2
+	max3 := min3 + leap
+	_ = max3
+
+	span := (max1 - min1)
 	scale := 0xFFFF / span
 
 	wid := len(cols)
@@ -49,18 +56,39 @@ func BuildImage(in <-chan []uint16, imprint string) image.Image {
 	img := image.NewRGBA64(bounds)
 	for x, col := range cols {
 		for y, e := range col {
-			val := scale * float64(e-fakemin)
-			if val < 0 {
-				val = 0
+			// First fill green.
+			green := scale * ((e) - min1)
+			if green < 0 {
+				green = 0
 			}
-			if val > 0xFFFF {
-				val = 0xFFFF
+			if green > 0xFFFF {
+				green = 0xFFFF
 			}
-			c := uint16(int(val))
-			img.SetRGBA64(x, hei-1-y, color.RGBA64{c, c, c, 0xFFFF})
+			// Then fill red, which with green makes yellow.
+			red := scale * ((e) - min2)
+			if red < 0 {
+				red = 0
+			}
+			if red > 0xFFFF {
+				red = 0xFFFF
+			}
+			// Then fill blue, which with green and red makes white.
+			blue := scale / 3 * ((e) - min3)
+			if blue < 0 {
+				blue = 0
+			}
+			if blue > 0xFFFF {
+				blue = 0xFFFF
+			}
+			img.SetRGBA64(x, hei-1-y, color.RGBA64{uint16(int(red)), uint16(int(green)), uint16(int(blue)), 0xFFFF})
 		}
 	}
-	green := color.RGBA64{0, 0xFFFF, 0, 0xFFFF}
+	// ink := color.RGBA64{0x2222, 0xFFFF, 0x2222, 0xFFFF} // Green
+	// ink := color.RGBA64{0xE600, 0x4C00, 0xE600, 0xFFFF}  // purple
+	ink := color.RGBA64{0xFFFF, 0x0000, 0xFFFF, 0xFFFF} // magenta
+	// ink := color.RGBA64{0xe666, 0x6666, 0x3333, 0xFFFF}  // Burnt Orange
+	// ink := color.RGBA64{0x3333, 0x3333, 0xffff, 0xFFFF}  // Blue
+	const N = 2 // screen pixels per chargen pixel
 	for i, r := range imprint {
 		if r > 255 {
 			r = 255
@@ -68,7 +96,11 @@ func BuildImage(in <-chan []uint16, imprint string) image.Image {
 		for x := 0; x < 5; x++ {
 			for y := 0; y < 8; y++ {
 				if font5x7.Pixel(byte(r), y, x) {
-					img.SetRGBA64(10+i*10+x, 10+y, green)
+					for a := 0; a < N; a++ {
+						for b := 0; b < N; b++ {
+							img.SetRGBA64(a+N*(10-y), b+4+i*7*N+x*N, ink)
+						}
+					}
 				}
 			}
 		}

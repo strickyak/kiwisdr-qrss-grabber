@@ -4,40 +4,37 @@ import (
 	"log"
 	"math"
 	"math/cmplx"
+
 	"mjibson/go-dsp/fft" // vendored.
 )
 
 var _ = log.Printf
 
-const SampPerSec = 12000
-const Nyquist = SampPerSec / 2
-const ImageHeight = 600
-const FFTSize = 1 << 14 // 14 or 15
-
-// const TargetBW = 300
-// const LoF = 1200
-// const HiF = LoF + TargetBW
-
-// const TargetBW = 1000
-// const LoF = 800
-// const HiF = LoF + TargetBW
-
-// Large band capture for now.
-const TargetBW = 700
-const LoF = 1000
-const HiF = LoF + TargetBW
-
-type Transform struct {
-	Samps   [FFTSize]float64
-	Shaped  [FFTSize]float64
+type Config struct {
+	Rate    int
+	Base    int
+	Center  int
+	Bw      int
+	FFTBits int // Log2 of FFT size, maximum 15.
 	Overlap float64
 }
 
-func GoRun(in <-chan int16, overlap float64) <-chan []uint16 {
+type Transform struct {
+	*Config
+	Size   int
+	Samps  []float64
+	Shaped []float64
+}
+
+func GoRun(in <-chan int16, cf *Config) <-chan []float64 {
+	size := 1 << uint(cf.FFTBits)
 	t := &Transform{
-		Overlap: overlap,
+		Config: cf,
+		Size:   size,
+		Samps:  make([]float64, size),
+		Shaped: make([]float64, size),
 	}
-	out := make(chan []uint16)
+	out := make(chan []float64)
 	go func() {
 		for {
 			t.Shift()
@@ -54,60 +51,41 @@ func GoRun(in <-chan int16, overlap float64) <-chan []uint16 {
 	return out
 }
 
-var once1 bool
+var logOnce bool
 
-func (t *Transform) NormalizeFFT(fft []complex128) []uint16 {
-	hi := int(FFTSize / 2 * HiF / Nyquist)
-	lo := int(FFTSize / 2 * LoF / Nyquist)
-	tall := hi - lo
-	if once1 {
-		log.Printf("FFTSize=%d Nyquist=%d", FFTSize, Nyquist)
+// Extract region of interest and convert to unsigned 16bit magnitudes.
+func (t *Transform) NormalizeFFT(fft []complex128) []float64 {
+	// Offsets above base frequeny for lo & hi edges of image.
+	hiOff := t.Center + t.Bw/2
+	loOff := t.Center - t.Bw/2
+	// Indices of region of interest in the FFT output.
+	Nyquist := t.Rate / 2
+	hi := int(t.Size / 2 * hiOff / Nyquist)
+	lo := int(t.Size / 2 * loOff / Nyquist)
+	tall := hi - lo + 1
+	if logOnce {
+		log.Printf("t.Size=%d Nyquist=%d", t.Size, Nyquist)
 		log.Printf("hi=%d lo=%d tall=%d", hi, lo, tall)
 	}
-	norm := make([]uint16, tall)
-	if false {
-		var min, max float64
-		for i := 0; i < FFTSize; i++ {
-			abs := 1000 * math.Log10(cmplx.Abs(fft[i]))
-			if abs > 65000 {
-				abs = 65000
-			}
-			if abs < min || min == 0 {
-				min = abs
-			}
-			if abs > max {
-				max = abs
-			}
-		}
-		// log.Printf("min: %f    max: %f", min, max)
-		for i := 0; i < FFTSize; i++ {
-			abs := 1000 * math.Log10(cmplx.Abs(fft[i]))
-			x := 65000 * (abs - min) / (max - min)
-			//log.Printf("     abs: %f        x: %f", abs, x)
-			if x > 65000 {
-				x = 65000
-			}
-			norm[i] = uint16(int(x))
-		}
-	} else {
-		for i := 0; i < tall; i++ {
-			abs := 1000 * math.Log10(cmplx.Abs(fft[i+lo]))
-			if abs > 65000 {
-				abs = 65000
-			}
-			norm[i] = uint16(int(abs))
-		}
+	// FFT results for region of interest.
+	results := make([]float64, tall)
+	for i := 0; i < tall; i++ {
+		// Trial and error lead to using math.Sqrt.
+		abs1 := math.Sqrt(cmplx.Abs(fft[i+lo]))
+		abs2 := math.Sqrt(cmplx.Abs(fft[t.Size-1-(i+lo)]))
+		// Average of the positive & negative freq magnitudes.
+		results[i] = (abs1 + abs2) / 2
 	}
-	return norm
+	return results
 }
 
-const RampLen = SampPerSec / 100 // 10ms
-var RaisedCosine [RampLen]float64
+const RampLen = 12000 / 100       // 10ms if 12k samples per second.
+var RaisedCosine [RampLen]float64 // Lookup table.
 
-func init() {
+func init() { // Precompute raised-cosine lookup table.
 	for i := 0; i < RampLen; i++ {
 		theta := float64(i) * math.Pi
-		// Rtarts at 0.0, rises to 1.0.
+		// Starts at 0.0, rises to 1.0.
 		RaisedCosine[i] = 1.0 - math.Cos(theta)/2.0
 	}
 }
@@ -118,41 +96,34 @@ func (t *Transform) CopyAndShapeSampsToShaped() {
 	// Shape front and back.
 	for i := 0; i < RampLen; i++ {
 		t.Shaped[i] *= RaisedCosine[i]
-		t.Shaped[FFTSize-1-i] *= RaisedCosine[i]
-	}
-
-	// Eliminate DC bias.
-	sum := 0.0
-	for _, e := range t.Shaped {
-		sum += e
-	}
-	avg := sum / float64(len(t.Shaped))
-	for i, _ := range t.Shaped {
-		t.Shaped[i] -= avg
+		t.Shaped[t.Size-1-i] *= RaisedCosine[i]
 	}
 }
+
 func (t *Transform) Shift() {
-	shiftSize := int(t.Overlap * FFTSize)
-	shiftFrom := FFTSize - shiftSize
+	shiftSize := int(t.Overlap * float64(t.Size))
+	shiftFrom := t.Size - shiftSize
 	copy(t.Samps[:shiftSize], t.Samps[shiftFrom:])
 }
 
 // returns true if eof was hit.
 func (t *Transform) Load(in <-chan int16) bool {
 	eof := false
-	shiftSize := int(t.Overlap * FFTSize)
-	shiftFrom := FFTSize - shiftSize
+	shiftSize := int((1.0 - t.Overlap) * float64(t.Size))
+	shiftFrom := t.Size - shiftSize
 	for i := 0; i < shiftSize; i++ {
 		if eof {
 			t.Samps[shiftFrom+i] = 0.0
 		} else {
-			x, ok := <-in
-			t.Samps[shiftFrom+i] = float64(x)
+			samp, ok := <-in
+			t.Samps[shiftFrom+i] = float64(samp)
 			eof = (!ok)
 		}
 	}
 	return eof
 }
+
 func (t *Transform) FFT() []complex128 {
-	return fft.FFTReal(t.Shaped[:])
+	// Use FFT implementation from mjibson/go-dsp/fft.
+	return fft.FFTReal(t.Shaped[:t.Size])
 }
